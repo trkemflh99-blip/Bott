@@ -1,34 +1,21 @@
 /**
- * TR10 Attendance Bot v3.1 (Fixed No-Response + Guild Block)
+ * TR10 Attendance Bot v3.1 (Stable Reply Fixed)
  * discord.js v14 + sqlite + Express Web Server
- *
- * Commands:
- *  - /setlog         (admin) set log channel per guild
- *  - /setmanagers    (admin) set managers role per guild
- *  - /panel          (manage guild) send attendance panel (FAST, no DB)
- *  - /status         (anyone) show current session status
- *  - /report         (managers/admin) report day/week/month by time + entries
- *  - /top            (anyone) top day/week/month/all (time + entries)
- *  - /sync           (owner) push commands global OR to current guild quickly
- *  - /resetguild     (owner) clear guild commands for current guild
- *  - /blockguild     (owner) disable bot in a guild
- *  - /unblockguild   (owner) enable bot back in a guild
- *  - /blockedguilds  (owner) list blocked guilds
  */
 
 require("dotenv").config();
 
-/* ================== WEB SERVER (Render Keep Alive) ================== */
+/* ================== WEB SERVER ================== */
 const express = require("express");
 const web = express();
 
-web.get("/", (req, res) => res.status(200).send("Attendance Bot v3 is running ✅"));
-web.get("/health", (req, res) => res.status(200).send("OK ✅"));
-web.all("*", (req, res) => res.status(200).send("OK ✅"));
+web.get("/", (req, res) => res.status(200).send("Attendance Bot Running ✅"));
+web.get("/health", (req, res) => res.status(200).send("OK"));
+web.all("*", (req, res) => res.status(200).send("OK"));
 
 const PORT = process.env.PORT || 3000;
-web.listen(PORT, () => console.log(`🌐 Web server running on port ${PORT}`));
-/* =================================================================== */
+web.listen(PORT, () => console.log(`🌐 Web server on ${PORT}`));
+/* ================================================= */
 
 const {
   Client,
@@ -52,61 +39,13 @@ const CLIENT_ID = process.env.CLIENT_ID;
 const OWNER_ID = process.env.OWNER_ID;
 const TZ = process.env.TZ || "Asia/Riyadh";
 
-console.log("🔧 ENV CHECK:", {
-  TOKEN: !!TOKEN,
-  CLIENT_ID: !!CLIENT_ID,
-  OWNER_ID: !!OWNER_ID,
-  TZ,
-  NODE: process.version,
-});
-
 if (!TOKEN || !CLIENT_ID || !OWNER_ID) {
-  console.error("❌ Missing env: TOKEN / CLIENT_ID / OWNER_ID");
+  console.log("❌ Missing ENV");
   process.exit(1);
 }
 
-/* ====== حماية: اطبع أي خطأ بوضوح ====== */
-process.on("unhandledRejection", (err) => console.error("❌ UNHANDLED REJECTION:", err));
-process.on("uncaughtException", (err) => console.error("❌ UNCAUGHT EXCEPTION:", err));
+/* ================== DATABASE ================== */
 
-/* ================== TIME HELPERS ================== */
-function fmtDateFrom(d) {
-  const fmt = new Intl.DateTimeFormat("en-CA", {
-    timeZone: TZ,
-    year: "numeric",
-    month: "2-digit",
-    day: "2-digit",
-  });
-  return fmt.format(d);
-}
-function fmtTimeFrom(d) {
-  const fmt = new Intl.DateTimeFormat("en-GB", {
-    timeZone: TZ,
-    hour: "2-digit",
-    minute: "2-digit",
-    second: "2-digit",
-    hour12: false,
-  });
-  return fmt.format(d);
-}
-function nowParts() {
-  const d = new Date();
-  return { ms: Date.now(), date: fmtDateFrom(d), time: fmtTimeFrom(d) };
-}
-function msToHMS(ms) {
-  const s = Math.max(0, Math.floor(ms / 1000));
-  const h = Math.floor(s / 3600);
-  const m = Math.floor((s % 3600) / 60);
-  const ss = s % 60;
-  return `${h}h ${m}m ${ss}s`;
-}
-function dateMinusDays(daysBack) {
-  const d = new Date();
-  d.setDate(d.getDate() - daysBack);
-  return fmtDateFrom(d);
-}
-
-/* ================== DB ================== */
 let db;
 
 async function initDb() {
@@ -114,582 +53,278 @@ async function initDb() {
     filename: "./attendance.db",
     driver: sqlite3.Database,
   });
-  await database.exec(`PRAGMA journal_mode = WAL;`);
-  await database.exec(`PRAGMA busy_timeout = 5000;`); // يقلل احتمال تعليق sqlite
+
+  await database.exec(`PRAGMA journal_mode=WAL;`);
+
+  await database.exec(`
+  CREATE TABLE IF NOT EXISTS settings(
+    guild_id TEXT PRIMARY KEY,
+    log_channel_id TEXT,
+    managers_role_id TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS sessions(
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    guild_id TEXT,
+    user_id TEXT,
+    session_no INTEGER,
+    checkin_ms INTEGER,
+    checkout_ms INTEGER,
+    duration_ms INTEGER,
+    checkin_date TEXT,
+    checkout_date TEXT
+  );
+
+  CREATE TABLE IF NOT EXISTS stats(
+    guild_id TEXT,
+    user_id TEXT,
+    total_time_ms INTEGER DEFAULT 0,
+    total_entries INTEGER DEFAULT 0,
+    PRIMARY KEY(guild_id,user_id)
+  );
+
+  CREATE TABLE IF NOT EXISTS blocked_guilds(
+    guild_id TEXT PRIMARY KEY
+  );
+  `);
+
   return database;
 }
 
-async function migrateDb() {
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS settings (
-      guild_id TEXT PRIMARY KEY,
-      log_channel_id TEXT,
-      managers_role_id TEXT
-    );
-  `);
+/* ================== CLIENT ================== */
 
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS sessions_v3 (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      session_no INTEGER NOT NULL,
-      checkin_ms INTEGER NOT NULL,
-      checkout_ms INTEGER,
-      duration_ms INTEGER,
-      checkin_date TEXT NOT NULL,
-      checkout_date TEXT
-    );
-  `);
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS stats_v3 (
-      guild_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      total_time_ms INTEGER NOT NULL DEFAULT 0,
-      total_entries INTEGER NOT NULL DEFAULT 0,
-      PRIMARY KEY (guild_id, user_id)
-    );
-  `);
-
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS logs_v3 (
-      id INTEGER PRIMARY KEY AUTOINCREMENT,
-      guild_id TEXT NOT NULL,
-      user_id TEXT NOT NULL,
-      action TEXT NOT NULL,
-      at_ms INTEGER NOT NULL,
-      at_date TEXT NOT NULL,
-      at_time TEXT NOT NULL,
-      session_no INTEGER NOT NULL,
-      duration_ms INTEGER
-    );
-  `);
-
-  // جدول حظر السيرفرات
-  await db.exec(`
-    CREATE TABLE IF NOT EXISTS blocked_guilds (
-      guild_id TEXT PRIMARY KEY,
-      blocked_at_ms INTEGER NOT NULL
-    );
-  `);
-
-  await db.exec(`
-    CREATE INDEX IF NOT EXISTS idx_sessionsv3_open
-      ON sessions_v3(guild_id, user_id) WHERE checkout_ms IS NULL;
-    CREATE INDEX IF NOT EXISTS idx_sessionsv3_date
-      ON sessions_v3(guild_id, checkout_date);
-    CREATE INDEX IF NOT EXISTS idx_logsv3_date
-      ON logs_v3(guild_id, at_date);
-  `);
-
-  console.log("✅ DB migrated/ready (v3 tables).");
-}
-
-/* ================== DISCORD CLIENT ================== */
 const client = new Client({
   intents: [GatewayIntentBits.Guilds],
 });
 
-client.on("error", (e) => console.error("❌ CLIENT ERROR:", e));
-client.on("shardError", (e) => console.error("❌ SHARD ERROR:", e));
+/* ================== HELPERS ================== */
 
-/* ================== SETTINGS HELPERS ================== */
-async function getSettings(guildId) {
-  let row = await db.get("SELECT * FROM settings WHERE guild_id = ?", [guildId]);
+function now() {
+  return Date.now();
+}
+
+function msToHMS(ms) {
+  const s = Math.floor(ms / 1000);
+  const h = Math.floor(s / 3600);
+  const m = Math.floor((s % 3600) / 60);
+  const sec = s % 60;
+  return `${h}h ${m}m ${sec}s`;
+}
+
+async function getOpen(gid, uid) {
+  return db.get(
+    `SELECT * FROM sessions WHERE guild_id=? AND user_id=? AND checkout_ms IS NULL`,
+    [gid, uid]
+  );
+}
+
+async function ensureSettings(gid) {
+  let row = await db.get(`SELECT * FROM settings WHERE guild_id=?`, [gid]);
   if (!row) {
     await db.run(
-      "INSERT INTO settings (guild_id, log_channel_id, managers_role_id) VALUES (?, NULL, NULL)",
-      [guildId]
+      `INSERT INTO settings(guild_id) VALUES(?)`,
+      [gid]
     );
-    row = await db.get("SELECT * FROM settings WHERE guild_id = ?", [guildId]);
+    row = await db.get(`SELECT * FROM settings WHERE guild_id=?`, [gid]);
   }
   return row;
 }
 
-function isManager(member, settingsRow) {
-  if (!member) return false;
-  if (member.permissions.has(PermissionFlagsBits.Administrator)) return true;
-  if (settingsRow?.managers_role_id && member.roles.cache.has(settingsRow.managers_role_id)) return true;
-  return false;
-}
+/* ================== COMMAND REGISTER ================== */
 
-async function sendLog(guild, settingsRow, embed) {
-  try {
-    if (!settingsRow?.log_channel_id) return;
-    const ch = await guild.channels.fetch(settingsRow.log_channel_id).catch(() => null);
-    if (!ch || !ch.isTextBased()) return;
-    await ch.send({ embeds: [embed] }).catch(() => {});
-  } catch (e) {
-    console.error("LOG SEND ERROR:", e);
-  }
-}
-
-/* ================== GUILD BLOCK ================== */
-async function isGuildBlocked(guildId) {
-  const row = await db.get("SELECT guild_id FROM blocked_guilds WHERE guild_id=?", [guildId]);
-  return !!row;
-}
-async function blockGuild(guildId) {
-  await db.run(
-    `INSERT INTO blocked_guilds (guild_id, blocked_at_ms) VALUES (?, ?)
-     ON CONFLICT(guild_id) DO UPDATE SET blocked_at_ms=excluded.blocked_at_ms`,
-    [guildId, Date.now()]
-  );
-}
-async function unblockGuild(guildId) {
-  await db.run("DELETE FROM blocked_guilds WHERE guild_id=?", [guildId]);
-}
-
-/* ================== PANEL ================== */
-function panelEmbed() {
-  return new EmbedBuilder()
-    .setTitle("نظام تسجيل الحضور")
-    .setDescription("سجّل دخولك وخروجك من الأزرار بالأسفل — ويتم تسجيل كل شيء في روم اللوق.")
-    .addFields(
-      { name: "✅ تسجيل دخول", value: "اضغط زر تسجيل دخول", inline: true },
-      { name: "💤 تسجيل خروج", value: "اضغط زر تسجيل خروج", inline: true }
-    )
-    .setColor(0x2b2d31);
-}
-
-function panelRow() {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId("att_in").setLabel("تسجيل دخول").setEmoji("⏰").setStyle(ButtonStyle.Success),
-    new ButtonBuilder().setCustomId("att_out").setLabel("تسجيل خروج").setEmoji("💤").setStyle(ButtonStyle.Danger)
-  );
-}
-
-/* ================== COMMANDS ================== */
-function buildCommandsJSON() {
+function buildCommands() {
   return [
     new SlashCommandBuilder()
-      .setName("setlog")
-      .setDescription("تحديد روم اللوق (لكل سيرفر)")
-      .addChannelOption((o) =>
-        o.setName("channel").setDescription("الروم").addChannelTypes(ChannelType.GuildText).setRequired(true)
-      )
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-
-    new SlashCommandBuilder()
-      .setName("setmanagers")
-      .setDescription("تحديد رتبة المسؤولين المسموح لهم بالتقارير (لكل سيرفر)")
-      .addRoleOption((o) => o.setName("role").setDescription("الرتبة").setRequired(true))
-      .setDefaultMemberPermissions(PermissionFlagsBits.Administrator),
-
-    new SlashCommandBuilder()
       .setName("panel")
-      .setDescription("إرسال لوحة تسجيل الدخول/الخروج")
-      .setDefaultMemberPermissions(PermissionFlagsBits.ManageGuild),
-
-    new SlashCommandBuilder().setName("status").setDescription("يعرض حالتك: داخل/خارج ومدة الجلسة الحالية"),
+      .setDescription("إرسال لوحة تسجيل الحضور"),
 
     new SlashCommandBuilder()
-      .setName("report")
-      .setDescription("تقرير (اليوم/الأسبوع/الشهر) — للمسؤولين")
-      .addStringOption((o) =>
-        o
-          .setName("range")
-          .setDescription("المدى")
-          .setRequired(true)
-          .addChoices(
-            { name: "اليوم", value: "day" },
-            { name: "الأسبوع", value: "week" },
-            { name: "الشهر", value: "month" }
-          )
-      ),
-
-    new SlashCommandBuilder()
-      .setName("top")
-      .setDescription("توب حسب الوقت + عدد الدخول (🔁)")
-      .addStringOption((o) =>
-        o
-          .setName("range")
-          .setDescription("المدى")
-          .setRequired(true)
-          .addChoices(
-            { name: "الكل (All-time)", value: "all" },
-            { name: "اليوم", value: "day" },
-            { name: "الأسبوع", value: "week" },
-            { name: "الشهر", value: "month" }
-          )
-      ),
+      .setName("status")
+      .setDescription("عرض حالتك الحالية"),
 
     new SlashCommandBuilder()
       .setName("sync")
-      .setDescription("OWNER: مزامنة الأوامر (guild سريع / global عام)")
-      .addStringOption((o) =>
-        o
-          .setName("scope")
-          .setDescription("نوع المزامنة")
+      .setDescription("OWNER: مزامنة الأوامر")
+      .addStringOption(o =>
+        o.setName("scope")
+          .setDescription("guild or global")
           .setRequired(true)
           .addChoices(
-            { name: "guild (سريع للسيرفر الحالي)", value: "guild" },
-            { name: "global (عام لكل السيرفرات)", value: "global" }
+            { name: "guild", value: "guild" },
+            { name: "global", value: "global" }
           )
       ),
 
-    new SlashCommandBuilder().setName("resetguild").setDescription("OWNER: حذف أوامر السيرفر الحالي"),
+    new SlashCommandBuilder()
+      .setName("resetguild")
+      .setDescription("OWNER: حذف أوامر السيرفر"),
 
-    // Owner: block/unblock
     new SlashCommandBuilder()
       .setName("blockguild")
-      .setDescription("OWNER: حظر سيرفر (البوت ما يشتغل فيه)")
-      .addStringOption((o) =>
-        o.setName("guild_id").setDescription("ايدي السيرفر (اختياري - الافتراضي الحالي)").setRequired(false)
-      ),
+      .setDescription("OWNER: حظر سيرفر"),
 
     new SlashCommandBuilder()
       .setName("unblockguild")
-      .setDescription("OWNER: فك حظر سيرفر")
-      .addStringOption((o) =>
-        o.setName("guild_id").setDescription("ايدي السيرفر (اختياري - الافتراضي الحالي)").setRequired(false)
-      ),
-
-    new SlashCommandBuilder().setName("blockedguilds").setDescription("OWNER: عرض السيرفرات المحظورة"),
-  ].map((c) => c.toJSON());
+      .setDescription("OWNER: فك حظر سيرفر"),
+  ].map(c => c.toJSON());
 }
 
-async function registerGlobalCommands() {
+async function registerGlobal() {
   const rest = new REST({ version: "10" }).setToken(TOKEN);
-  await rest.put(Routes.applicationCommands(CLIENT_ID), { body: buildCommandsJSON() });
-  console.log("✅ Global slash commands pushed.");
-}
-async function registerGuildCommands(guildId) {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guildId), { body: buildCommandsJSON() });
-  console.log(`✅ Guild slash commands pushed for ${guildId}.`);
-}
-async function clearGuildCommands(guildId) {
-  const rest = new REST({ version: "10" }).setToken(TOKEN);
-  await rest.put(Routes.applicationGuildCommands(CLIENT_ID, guildId), { body: [] });
-  console.log(`✅ Guild slash commands CLEARED for ${guildId}.`);
-}
-
-/* ================== CORE QUERIES (v3) ================== */
-async function getOpenSession(gid, uid) {
-  return db.get(
-    "SELECT * FROM sessions_v3 WHERE guild_id=? AND user_id=? AND checkout_ms IS NULL ORDER BY id DESC LIMIT 1",
-    [gid, uid]
+  await rest.put(
+    Routes.applicationCommands(CLIENT_ID),
+    { body: buildCommands() }
   );
-}
-async function getNextSessionNo(gid, uid) {
-  const row = await db.get("SELECT total_entries FROM stats_v3 WHERE guild_id=? AND user_id=?", [gid, uid]);
-  return (row?.total_entries || 0) + 1;
-}
-async function upsertStatsOnCheckout(gid, uid, durationMs) {
-  await db.run(
-    `
-    INSERT INTO stats_v3 (guild_id, user_id, total_time_ms, total_entries)
-    VALUES (?, ?, ?, 1)
-    ON CONFLICT(guild_id, user_id)
-    DO UPDATE SET
-      total_time_ms = total_time_ms + excluded.total_time_ms,
-      total_entries = total_entries + 1
-  `,
-    [gid, uid, durationMs]
-  );
-}
-
-function makeDateList(range) {
-  const dates = [];
-  if (range === "day") dates.push(dateMinusDays(0));
-  if (range === "week") for (let i = 0; i < 7; i++) dates.push(dateMinusDays(i));
-  if (range === "month") for (let i = 0; i < 30; i++) dates.push(dateMinusDays(i));
-  return dates;
-}
-
-async function aggregateByRange(gid, range) {
-  const dates = makeDateList(range);
-  const placeholders = dates.map(() => "?").join(",");
-  const rows = await db.all(
-    `
-    SELECT user_id,
-           SUM(COALESCE(duration_ms, 0)) AS total_time_ms,
-           COUNT(*) AS entries
-    FROM sessions_v3
-    WHERE guild_id = ?
-      AND checkout_ms IS NOT NULL
-      AND checkout_date IN (${placeholders})
-    GROUP BY user_id
-    ORDER BY total_time_ms DESC, entries DESC
-  `,
-    [gid, ...dates]
-  );
-  return rows;
+  console.log("✅ Global Commands Registered");
 }
 
 /* ================== READY ================== */
+
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  await registerGlobalCommands().catch((e) => console.error("Global register error:", e));
+  await registerGlobal();
 });
 
-/* ================== INTERACTIONS ================== */
+/* ================== INTERACTIONS (FIXED) ================== */
+
 client.on("interactionCreate", async (interaction) => {
   try {
-    if (!interaction.inGuild()) {
-      if (interaction.isRepliable()) {
-        return interaction.reply({ content: "❌ هذا البوت يشتغل داخل السيرفرات فقط.", ephemeral: true });
-      }
-      return;
-    }
+
+    if (!interaction.inGuild()) return;
 
     const gid = interaction.guildId;
+    const uid = interaction.user.id;
 
-    // إذا السيرفر محظور: امنع كل شيء (إلا الأونر)
-    if (interaction.user.id !== OWNER_ID) {
-      const blocked = await isGuildBlocked(gid).catch(() => false);
-      if (blocked) {
-        if (interaction.isChatInputCommand() || interaction.isButton()) {
-          if (interaction.isRepliable()) {
-            return interaction.reply({ content: "⛔ البوت **متوقف** في هذا السيرفر (محظور من الأونر).", ephemeral: true });
-          }
-        }
-        return;
-      }
-    }
-
-    /* ---------- SLASH ---------- */
     if (interaction.isChatInputCommand()) {
+
       const cmd = interaction.commandName;
 
-      // /panel لازم يرد فورًا (بدون DB) عشان ما يطلع did not respond
+      if (!interaction.deferred && !interaction.replied)
+        await interaction.deferReply({ ephemeral: true });
+
       if (cmd === "panel") {
-        return interaction.reply({ embeds: [panelEmbed()], components: [panelRow()] });
-      }
-
-      // باقي الأوامر: نأمن أنفسنا بـ deferReply
-      await interaction.deferReply({ ephemeral: true }).catch(() => null);
-
-      // Owner commands
-      if (cmd === "sync") {
-        if (interaction.user.id !== OWNER_ID) return interaction.editReply("❌ هذا الأمر للأونر فقط.");
-        const scope = interaction.options.getString("scope", true);
-        if (scope === "guild") {
-          await registerGuildCommands(gid);
-          return interaction.editReply("✅ تمّت مزامنة الأوامر سريعًا لهذا السيرفر.");
-        }
-        await registerGlobalCommands();
-        return interaction.editReply("✅ تم رفع الأوامر عامّة.");
-      }
-
-      if (cmd === "resetguild") {
-        if (interaction.user.id !== OWNER_ID) return interaction.editReply("❌ هذا الأمر للأونر فقط.");
-        await clearGuildCommands(gid);
-        return interaction.editReply("✅ تم مسح أوامر هذا السيرفر.");
-      }
-
-      if (cmd === "blockguild") {
-        if (interaction.user.id !== OWNER_ID) return interaction.editReply("❌ هذا الأمر للأونر فقط.");
-        const target = interaction.options.getString("guild_id") || gid;
-        await blockGuild(target);
-        return interaction.editReply(`⛔ تم حظر السيرفر: \`${target}\``);
-      }
-
-      if (cmd === "unblockguild") {
-        if (interaction.user.id !== OWNER_ID) return interaction.editReply("❌ هذا الأمر للأونر فقط.");
-        const target = interaction.options.getString("guild_id") || gid;
-        await unblockGuild(target);
-        return interaction.editReply(`✅ تم فك الحظر عن السيرفر: \`${target}\``);
-      }
-
-      if (cmd === "blockedguilds") {
-        if (interaction.user.id !== OWNER_ID) return interaction.editReply("❌ هذا الأمر للأونر فقط.");
-        const rows = await db.all("SELECT guild_id, blocked_at_ms FROM blocked_guilds ORDER BY blocked_at_ms DESC");
-        if (!rows.length) return interaction.editReply("✅ ما فيه سيرفرات محظورة.");
-        const lines = rows.slice(0, 25).map((r, i) => `**${i + 1})** \`${r.guild_id}\``).join("\n");
-        const emb = new EmbedBuilder().setTitle("⛔ السيرفرات المحظورة").setDescription(lines).setColor(0x2b2d31);
-        return interaction.editReply({ embeds: [emb] });
-      }
-
-      // Per-guild settings (needs DB)
-      if (cmd === "setlog") {
-        const ch = interaction.options.getChannel("channel", true);
-        await getSettings(gid); // ensure row exists
-        await db.run("UPDATE settings SET log_channel_id=? WHERE guild_id=?", [ch.id, gid]);
-        return interaction.editReply(`✅ تم تعيين روم اللوق: <#${ch.id}>`);
-      }
-
-      if (cmd === "setmanagers") {
-        const role = interaction.options.getRole("role", true);
-        await getSettings(gid);
-        await db.run("UPDATE settings SET managers_role_id=? WHERE guild_id=?", [role.id, gid]);
-        return interaction.editReply(`✅ تم تعيين رتبة المسؤولين: <@&${role.id}>`);
+        return interaction.editReply({
+          embeds: [
+            new EmbedBuilder()
+              .setTitle("نظام تسجيل الحضور")
+              .setDescription("استخدم الأزرار للتسجيل")
+          ],
+          components: [
+            new ActionRowBuilder().addComponents(
+              new ButtonBuilder()
+                .setCustomId("in")
+                .setLabel("تسجيل دخول")
+                .setStyle(ButtonStyle.Success),
+              new ButtonBuilder()
+                .setCustomId("out")
+                .setLabel("تسجيل خروج")
+                .setStyle(ButtonStyle.Danger)
+            )
+          ]
+        });
       }
 
       if (cmd === "status") {
-        const openSession = await getOpenSession(gid, interaction.user.id);
-        if (!openSession) return interaction.editReply("📌 حالتك: **خارج** (ما عندك جلسة مفتوحة).");
+        const open = await getOpen(gid, uid);
+        if (!open)
+          return interaction.editReply("📌 أنت خارج");
 
-        const elapsed = Date.now() - openSession.checkin_ms;
-        const p = nowParts();
-        return interaction.editReply(
-          `📌 حالتك: **داخل**\n🔁 رقم الدخول: (**${openSession.session_no}**)\n🗓️ بداية: ${openSession.checkin_date}\n🕒 الآن: ${p.time}\n⏳ المدة: ${msToHMS(elapsed)}`
+        const duration = now() - open.checkin_ms;
+        return interaction.editReply(`⏱️ داخل منذ ${msToHMS(duration)}`);
+      }
+
+      if (cmd === "sync" && uid === OWNER_ID) {
+        const scope = interaction.options.getString("scope");
+        if (scope === "global") await registerGlobal();
+        return interaction.editReply("✅ تم المزامنة");
+      }
+
+      if (cmd === "resetguild" && uid === OWNER_ID) {
+        const rest = new REST({ version: "10" }).setToken(TOKEN);
+        await rest.put(
+          Routes.applicationGuildCommands(CLIENT_ID, gid),
+          { body: [] }
         );
+        return interaction.editReply("✅ تم حذف أوامر السيرفر");
       }
 
-      if (cmd === "report") {
-        const settingsRow = await getSettings(gid);
-        const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
-        if (!isManager(member, settingsRow)) return interaction.editReply("❌ هذا الأمر للمسؤولين فقط.");
-
-        const range = interaction.options.getString("range", true);
-        const rows = await aggregateByRange(gid, range);
-
-        const top = rows.slice(0, 15);
-        const lines = top.length
-          ? top
-              .map((r, i) => `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.entries || 0})`)
-              .join("\n")
-          : "لا يوجد بيانات في هذا المدى.";
-
-        const title = range === "day" ? "تقرير اليوم" : range === "week" ? "تقرير الأسبوع" : "تقرير الشهر";
-        const emb = new EmbedBuilder().setTitle(`📊 ${title}`).setDescription(lines).setColor(0x2b2d31);
-        return interaction.editReply({ embeds: [emb] });
+      if (cmd === "blockguild" && uid === OWNER_ID) {
+        await db.run(`INSERT OR IGNORE INTO blocked_guilds VALUES(?)`, [gid]);
+        return interaction.editReply("⛔ تم الحظر");
       }
 
-      if (cmd === "top") {
-        const range = interaction.options.getString("range", true);
-
-        if (range === "all") {
-          const rows = await db.all(
-            `SELECT user_id, total_time_ms, total_entries
-             FROM stats_v3
-             WHERE guild_id=?
-             ORDER BY total_time_ms DESC, total_entries DESC`,
-            [gid]
-          );
-
-          const top = rows.slice(0, 15);
-          const lines = top.length
-            ? top
-                .map((r, i) => `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.total_entries || 0})`)
-                .join("\n")
-            : "لا يوجد بيانات حتى الآن.";
-
-          const emb = new EmbedBuilder().setTitle("🏆 Top (All-time)").setDescription(lines).setColor(0x2b2d31);
-          return interaction.editReply({ embeds: [emb] });
-        }
-
-        const rows = await aggregateByRange(gid, range);
-        const top = rows.slice(0, 15);
-        const lines = top.length
-          ? top
-              .map((r, i) => `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.entries || 0})`)
-              .join("\n")
-          : "لا يوجد بيانات في هذا المدى.";
-
-        const title = range === "day" ? "Top اليوم" : range === "week" ? "Top الأسبوع" : "Top الشهر";
-        const emb = new EmbedBuilder().setTitle(`🏆 ${title}`).setDescription(lines).setColor(0x2b2d31);
-        return interaction.editReply({ embeds: [emb] });
+      if (cmd === "unblockguild" && uid === OWNER_ID) {
+        await db.run(`DELETE FROM blocked_guilds WHERE guild_id=?`, [gid]);
+        return interaction.editReply("✅ تم فك الحظر");
       }
 
-      return interaction.editReply("❓ أمر غير معروف.");
     }
 
-    /* ---------- BUTTONS ---------- */
     if (interaction.isButton()) {
-      // رد سريع جدًا لتفادي timeout
-      await interaction.deferReply({ ephemeral: true }).catch(() => null);
 
-      const settingsRow = await getSettings(gid);
-      const { date, time, ms } = nowParts();
-      const uid = interaction.user.id;
+      if (!interaction.deferred && !interaction.replied)
+        await interaction.deferReply({ ephemeral: true });
 
-      if (interaction.customId === "att_in") {
-        const openSession = await getOpenSession(gid, uid);
-        if (openSession) return interaction.editReply("⚠️ أنت مسجل **دخول** بالفعل. لازم تسجل خروج أول.");
+      if (interaction.customId === "in") {
 
-        const row = await db.get("SELECT total_entries FROM stats_v3 WHERE guild_id=? AND user_id=?", [gid, uid]);
+        const open = await getOpen(gid, uid);
+        if (open)
+          return interaction.editReply("⚠️ مسجل بالفعل");
+
+        const row = await db.get(
+          `SELECT total_entries FROM stats WHERE guild_id=? AND user_id=?`,
+          [gid, uid]
+        );
+
         const sessionNo = (row?.total_entries || 0) + 1;
 
         await db.run(
-          `INSERT INTO sessions_v3 (guild_id, user_id, session_no, checkin_ms, checkout_ms, duration_ms, checkin_date, checkout_date)
-           VALUES (?, ?, ?, ?, NULL, NULL, ?, NULL)`,
-          [gid, uid, sessionNo, ms, date]
+          `INSERT INTO sessions(guild_id,user_id,session_no,checkin_ms,checkin_date)
+           VALUES(?,?,?,?,?)`,
+          [gid, uid, sessionNo, now(), new Date().toISOString()]
         );
 
-        await db.run(
-          `INSERT INTO logs_v3 (guild_id, user_id, action, at_ms, at_date, at_time, session_no, duration_ms)
-           VALUES (?, ?, 'IN', ?, ?, ?, ?, NULL)`,
-          [gid, uid, ms, date, time, sessionNo]
-        );
-
-        const emb = new EmbedBuilder()
-          .setTitle("✅ تسجيل دخول")
-          .setDescription(`👤 <@${uid}>\n🕒 ${time}\n🗓️ ${date}\n🔁 رقم الدخول: (**${sessionNo}**)`)
-          .setColor(0x00cc66);
-
-        await sendLog(interaction.guild, settingsRow, emb);
-        return interaction.editReply(`✅ تم تسجيل دخولك 🔁 (${sessionNo})`);
+        return interaction.editReply(`✅ تم تسجيل دخولك (${sessionNo})`);
       }
 
-      if (interaction.customId === "att_out") {
-        const openSession = await getOpenSession(gid, uid);
-        if (!openSession) return interaction.editReply("⚠️ ما عندك جلسة مفتوحة. سجل دخول أول.");
+      if (interaction.customId === "out") {
 
-        const duration = ms - openSession.checkin_ms;
+        const open = await getOpen(gid, uid);
+        if (!open)
+          return interaction.editReply("⚠️ لا يوجد جلسة");
+
+        const duration = now() - open.checkin_ms;
 
         await db.run(
-          `UPDATE sessions_v3
-           SET checkout_ms=?, duration_ms=?, checkout_date=?
-           WHERE id=?`,
-          [ms, duration, date, openSession.id]
+          `UPDATE sessions SET checkout_ms=?,duration_ms=? WHERE id=?`,
+          [now(), duration, open.id]
         );
 
         await db.run(
-          `
-          INSERT INTO stats_v3 (guild_id, user_id, total_time_ms, total_entries)
-          VALUES (?, ?, ?, 1)
-          ON CONFLICT(guild_id, user_id)
-          DO UPDATE SET
-            total_time_ms = total_time_ms + excluded.total_time_ms,
-            total_entries = total_entries + 1
-        `,
-          [gid, uid, duration]
+          `INSERT INTO stats(guild_id,user_id,total_time_ms,total_entries)
+           VALUES(?,?,?,1)
+           ON CONFLICT(guild_id,user_id)
+           DO UPDATE SET
+             total_time_ms=total_time_ms+?,
+             total_entries=total_entries+1`,
+          [gid, uid, duration, duration]
         );
 
-        await db.run(
-          `INSERT INTO logs_v3 (guild_id, user_id, action, at_ms, at_date, at_time, session_no, duration_ms)
-           VALUES (?, ?, 'OUT', ?, ?, ?, ?, ?)`,
-          [gid, uid, ms, date, time, openSession.session_no, duration]
-        );
-
-        const emb = new EmbedBuilder()
-          .setTitle("💤 تسجيل خروج")
-          .setDescription(
-            `👤 <@${uid}>\n🕒 ${time}\n🗓️ ${date}\n⏱️ مدة الجلسة: **${msToHMS(duration)}**\n🔁 رقم الدخول: (**${openSession.session_no}**)`
-          )
-          .setColor(0xff3344);
-
-        await sendLog(interaction.guild, settingsRow, emb);
-        return interaction.editReply(`💤 تم تسجيل خروجك — ⏱️ ${msToHMS(duration)} 🔁 (${openSession.session_no})`);
+        return interaction.editReply(`💤 تم تسجيل خروجك — ${msToHMS(duration)}`);
       }
 
-      return interaction.editReply("زر غير معروف.");
     }
-  } catch (e) {
-    console.error("INTERACTION ERROR:", e);
-    try {
-      const msg = "صار خطأ بسيط. تأكد من صلاحيات البوت + روم اللوق.";
-      if (interaction?.replied || interaction?.deferred) await interaction.followUp({ content: msg, ephemeral: true });
-      else if (interaction?.isRepliable()) await interaction.reply({ content: msg, ephemeral: true });
-    } catch {}
+
+  } catch (err) {
+    console.log("❌ Interaction Error:", err);
+    if (interaction.isRepliable())
+      interaction.reply({ content: "حدث خطأ بسيط", ephemeral: true }).catch(()=>{});
   }
 });
 
 /* ================== START ================== */
+
 (async () => {
   db = await initDb();
-  await migrateDb();
-
-  try {
-    console.log("🔌 Trying to login to Discord...");
-    await client.login(TOKEN);
-    console.log("✅ LOGIN SUCCESS");
-  } catch (e) {
-    console.error("❌ LOGIN FAILED (TOKEN/NETWORK/ENV):", e);
-    process.exit(1);
-  }
+  await client.login(TOKEN);
 })();
