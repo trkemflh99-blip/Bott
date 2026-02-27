@@ -16,13 +16,23 @@
 
 require("dotenv").config();
 
-/* ================== WEB SERVER (Render Keep Alive) ================== */
+/* ================== WEB SERVER (Render + UptimeRobot) ================== */
 const express = require("express");
 const web = express();
-web.get("/", (req, res) => res.send("Attendance Bot v3 is running ✅"));
+
+// Root
+web.get("/", (req, res) => {
+  res.status(200).send("Attendance Bot v3 is running ✅");
+});
+
+// Health endpoint (for UptimeRobot)
+web.get("/health", (req, res) => {
+  res.status(200).json({ status: "ok" });
+});
+
 const PORT = process.env.PORT || 3000;
 web.listen(PORT, () => console.log(`🌐 Web server running on port ${PORT}`));
-/* =================================================================== */
+/* ====================================================================== */
 
 const {
   Client,
@@ -95,39 +105,23 @@ function dateMinusDays(daysBack) {
 /* ================== DB ================== */
 let db;
 
-// util: check column exists
-async function hasColumn(table, col) {
-  const rows = await db.all(`PRAGMA table_info(${table})`);
-  return rows.some((r) => r.name === col);
-}
-
-// util: table exists
-async function hasTable(table) {
-  const row = await db.get(
-    `SELECT name FROM sqlite_master WHERE type='table' AND name=?`,
-    [table]
-  );
-  return !!row;
-}
-
 async function initDb() {
   const database = await open({
     filename: "./attendance.db",
     driver: sqlite3.Database,
   });
-
   await database.exec(`PRAGMA journal_mode = WAL;`);
+  await database.exec(`PRAGMA foreign_keys = ON;`);
   return database;
 }
 
 /**
  * DB Migration strategy:
  * - Create v3 tables if not exist
- * - If old tables exist, keep them (no crash)
- * - Our code ONLY uses v3 tables, so no "no such column" ever
+ * - Our code ONLY uses v3 tables (sessions_v3 / stats_v3 / logs_v3)
  */
 async function migrateDb() {
-  // settings table (shared)
+  // settings
   await db.exec(`
     CREATE TABLE IF NOT EXISTS settings (
       guild_id TEXT PRIMARY KEY,
@@ -136,7 +130,7 @@ async function migrateDb() {
     );
   `);
 
-  // v3 sessions
+  // sessions v3
   await db.exec(`
     CREATE TABLE IF NOT EXISTS sessions_v3 (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -151,7 +145,7 @@ async function migrateDb() {
     );
   `);
 
-  // v3 stats
+  // stats v3
   await db.exec(`
     CREATE TABLE IF NOT EXISTS stats_v3 (
       guild_id TEXT NOT NULL,
@@ -162,7 +156,7 @@ async function migrateDb() {
     );
   `);
 
-  // v3 logs
+  // logs v3
   await db.exec(`
     CREATE TABLE IF NOT EXISTS logs_v3 (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -188,7 +182,6 @@ async function migrateDb() {
       ON logs_v3(guild_id, at_date);
   `);
 
-  // Ensure settings row per guild is created lazily in getSettings()
   console.log("✅ DB migrated/ready (v3 tables).");
 }
 
@@ -220,9 +213,13 @@ function isManager(member, settingsRow) {
 async function sendLog(guild, settingsRow, embed) {
   try {
     if (!settingsRow?.log_channel_id) return;
+
     const ch = await guild.channels.fetch(settingsRow.log_channel_id).catch(() => null);
     if (!ch) return;
+
+    // safer than checking ChannelType
     if (!ch.isTextBased()) return;
+
     await ch.send({ embeds: [embed] }).catch(() => {});
   } catch (e) {
     console.error("LOG SEND ERROR:", e);
@@ -263,7 +260,8 @@ function buildCommandsJSON() {
       .setName("setlog")
       .setDescription("تحديد روم اللوق (لكل سيرفر)")
       .addChannelOption((o) =>
-        o.setName("channel")
+        o
+          .setName("channel")
           .setDescription("الروم")
           .addChannelTypes(ChannelType.GuildText)
           .setRequired(true)
@@ -289,7 +287,8 @@ function buildCommandsJSON() {
       .setName("report")
       .setDescription("تقرير (اليوم/الأسبوع/الشهر) — للمسؤولين")
       .addStringOption((o) =>
-        o.setName("range")
+        o
+          .setName("range")
           .setDescription("المدى")
           .setRequired(true)
           .addChoices(
@@ -303,7 +302,8 @@ function buildCommandsJSON() {
       .setName("top")
       .setDescription("توب حسب الوقت + عدد الدخول (🔁)")
       .addStringOption((o) =>
-        o.setName("range")
+        o
+          .setName("range")
           .setDescription("المدى")
           .setRequired(true)
           .addChoices(
@@ -318,7 +318,8 @@ function buildCommandsJSON() {
       .setName("sync")
       .setDescription("OWNER: مزامنة الأوامر (guild سريع / global عام)")
       .addStringOption((o) =>
-        o.setName("scope")
+        o
+          .setName("scope")
           .setDescription("نوع المزامنة")
           .setRequired(true)
           .addChoices(
@@ -357,10 +358,7 @@ async function getOpenSession(gid, uid) {
   );
 }
 async function getNextSessionNo(gid, uid) {
-  const row = await db.get(
-    "SELECT total_entries FROM stats_v3 WHERE guild_id=? AND user_id=?",
-    [gid, uid]
-  );
+  const row = await db.get("SELECT total_entries FROM stats_v3 WHERE guild_id=? AND user_id=?", [gid, uid]);
   return (row?.total_entries || 0) + 1;
 }
 async function upsertStatsOnCheckout(gid, uid, durationMs) {
@@ -408,18 +406,27 @@ async function aggregateByRange(gid, range) {
 /* ================== READY ================== */
 client.once("ready", async () => {
   console.log(`✅ Logged in as ${client.user.tag}`);
-  // ملاحظة: الأوامر العامة قد تأخذ وقت — عشان كذا /sync guild
+  // الأوامر العامة قد تتأخر بالظهور — عندك /sync guild سريع
   await registerGlobalCommands().catch((e) => console.error("Global register error:", e));
 });
+
+/* ================== SAFE REPLY (NO "Unknown interaction") ================== */
+async function safeReply(interaction, payload) {
+  try {
+    if (interaction.replied || interaction.deferred) {
+      return await interaction.followUp(payload).catch(() => {});
+    }
+    if (interaction.isRepliable()) {
+      return await interaction.reply(payload).catch(() => {});
+    }
+  } catch {}
+}
 
 /* ================== INTERACTIONS ================== */
 client.on("interactionCreate", async (interaction) => {
   try {
     if (!interaction.inGuild()) {
-      if (interaction.isRepliable()) {
-        return interaction.reply({ content: "❌ هذا البوت يشتغل داخل السيرفرات فقط.", ephemeral: true });
-      }
-      return;
+      return safeReply(interaction, { content: "❌ هذا البوت يشتغل داخل السيرفرات فقط.", ephemeral: true });
     }
 
     const gid = interaction.guildId;
@@ -429,51 +436,51 @@ client.on("interactionCreate", async (interaction) => {
       const settingsRow = await getSettings(gid);
 
       if (interaction.commandName === "sync") {
-        if (interaction.user.id !== OWNER_ID)
-          return interaction.reply({ content: "❌ هذا الأمر للأونر فقط.", ephemeral: true });
-
+        if (interaction.user.id !== OWNER_ID) {
+          return safeReply(interaction, { content: "❌ هذا الأمر للأونر فقط.", ephemeral: true });
+        }
         const scope = interaction.options.getString("scope", true);
         if (scope === "guild") {
           await registerGuildCommands(gid);
-          return interaction.reply({ content: "✅ تمّت مزامنة الأوامر سريعًا لهذا السيرفر.", ephemeral: true });
+          return safeReply(interaction, { content: "✅ تمّت مزامنة الأوامر سريعًا لهذا السيرفر.", ephemeral: true });
         } else {
           await registerGlobalCommands();
-          return interaction.reply({ content: "✅ تم رفع الأوامر عامّة.", ephemeral: true });
+          return safeReply(interaction, { content: "✅ تم رفع الأوامر عامّة.", ephemeral: true });
         }
       }
 
       if (interaction.commandName === "resetguild") {
-        if (interaction.user.id !== OWNER_ID)
-          return interaction.reply({ content: "❌ هذا الأمر للأونر فقط.", ephemeral: true });
-
+        if (interaction.user.id !== OWNER_ID) {
+          return safeReply(interaction, { content: "❌ هذا الأمر للأونر فقط.", ephemeral: true });
+        }
         await clearGuildCommands(gid);
-        return interaction.reply({ content: "✅ تم مسح أوامر هذا السيرفر.", ephemeral: true });
+        return safeReply(interaction, { content: "✅ تم مسح أوامر هذا السيرفر.", ephemeral: true });
       }
 
       if (interaction.commandName === "setlog") {
         const ch = interaction.options.getChannel("channel", true);
         await db.run("UPDATE settings SET log_channel_id=? WHERE guild_id=?", [ch.id, gid]);
-        return interaction.reply({ content: `✅ تم تعيين روم اللوق: <#${ch.id}>`, ephemeral: true });
+        return safeReply(interaction, { content: `✅ تم تعيين روم اللوق: <#${ch.id}>`, ephemeral: true });
       }
 
       if (interaction.commandName === "setmanagers") {
         const role = interaction.options.getRole("role", true);
         await db.run("UPDATE settings SET managers_role_id=? WHERE guild_id=?", [role.id, gid]);
-        return interaction.reply({ content: `✅ تم تعيين رتبة المسؤولين: <@&${role.id}>`, ephemeral: true });
+        return safeReply(interaction, { content: `✅ تم تعيين رتبة المسؤولين: <@&${role.id}>`, ephemeral: true });
       }
 
       if (interaction.commandName === "panel") {
-        return interaction.reply({ embeds: [panelEmbed()], components: [panelRow()] });
+        return safeReply(interaction, { embeds: [panelEmbed()], components: [panelRow()] });
       }
 
       if (interaction.commandName === "status") {
         const openSession = await getOpenSession(gid, interaction.user.id);
         if (!openSession) {
-          return interaction.reply({ content: "📌 حالتك: **خارج** (ما عندك جلسة مفتوحة).", ephemeral: true });
+          return safeReply(interaction, { content: "📌 حالتك: **خارج** (ما عندك جلسة مفتوحة).", ephemeral: true });
         }
         const elapsed = Date.now() - openSession.checkin_ms;
         const p = nowParts();
-        return interaction.reply({
+        return safeReply(interaction, {
           content: `📌 حالتك: **داخل**\n🔁 رقم الدخول: (**${openSession.session_no}**)\n🗓️ بداية: ${openSession.checkin_date}\n🕒 الآن: ${p.time}\n⏳ المدة: ${msToHMS(elapsed)}`,
           ephemeral: true,
         });
@@ -482,7 +489,7 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.commandName === "report") {
         const member = await interaction.guild.members.fetch(interaction.user.id).catch(() => null);
         if (!isManager(member, settingsRow)) {
-          return interaction.reply({ content: "❌ هذا الأمر للمسؤولين فقط.", ephemeral: true });
+          return safeReply(interaction, { content: "❌ هذا الأمر للمسؤولين فقط.", ephemeral: true });
         }
 
         const range = interaction.options.getString("range", true);
@@ -491,13 +498,16 @@ client.on("interactionCreate", async (interaction) => {
         const top = rows.slice(0, 15);
         const lines = top.length
           ? top
-              .map((r, i) => `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.entries || 0})`)
+              .map(
+                (r, i) =>
+                  `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.entries || 0})`
+              )
               .join("\n")
           : "لا يوجد بيانات في هذا المدى.";
 
         const title = range === "day" ? "تقرير اليوم" : range === "week" ? "تقرير الأسبوع" : "تقرير الشهر";
         const emb = new EmbedBuilder().setTitle(`📊 ${title}`).setDescription(lines).setColor(0x2b2d31);
-        return interaction.reply({ embeds: [emb], ephemeral: true });
+        return safeReply(interaction, { embeds: [emb], ephemeral: true });
       }
 
       if (interaction.commandName === "top") {
@@ -515,24 +525,31 @@ client.on("interactionCreate", async (interaction) => {
           const top = rows.slice(0, 15);
           const lines = top.length
             ? top
-                .map((r, i) => `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.total_entries || 0})`)
+                .map(
+                  (r, i) =>
+                    `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.total_entries || 0})`
+                )
                 .join("\n")
             : "لا يوجد بيانات حتى الآن.";
 
           const emb = new EmbedBuilder().setTitle("🏆 Top (All-time)").setDescription(lines).setColor(0x2b2d31);
-          return interaction.reply({ embeds: [emb], ephemeral: true });
+          return safeReply(interaction, { embeds: [emb], ephemeral: true });
         } else {
           const rows = await aggregateByRange(gid, range);
+
           const top = rows.slice(0, 15);
           const lines = top.length
             ? top
-                .map((r, i) => `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.entries || 0})`)
+                .map(
+                  (r, i) =>
+                    `**${i + 1})** <@${r.user_id}> — ⏱️ **${msToHMS(r.total_time_ms || 0)}** 🔁 (${r.entries || 0})`
+                )
                 .join("\n")
             : "لا يوجد بيانات في هذا المدى.";
 
           const title = range === "day" ? "Top اليوم" : range === "week" ? "Top الأسبوع" : "Top الشهر";
           const emb = new EmbedBuilder().setTitle(`🏆 ${title}`).setDescription(lines).setColor(0x2b2d31);
-          return interaction.reply({ embeds: [emb], ephemeral: true });
+          return safeReply(interaction, { embeds: [emb], ephemeral: true });
         }
       }
     }
@@ -546,7 +563,7 @@ client.on("interactionCreate", async (interaction) => {
       if (interaction.customId === "att_in") {
         const openSession = await getOpenSession(gid, uid);
         if (openSession) {
-          return interaction.reply({ content: "⚠️ أنت مسجل **دخول** بالفعل. لازم تسجل خروج أول.", ephemeral: true });
+          return safeReply(interaction, { content: "⚠️ أنت مسجل **دخول** بالفعل. لازم تسجل خروج أول.", ephemeral: true });
         }
 
         const sessionNo = await getNextSessionNo(gid, uid);
@@ -569,13 +586,13 @@ client.on("interactionCreate", async (interaction) => {
           .setColor(0x00cc66);
 
         await sendLog(interaction.guild, settingsRow, emb);
-        return interaction.reply({ content: `✅ تم تسجيل دخولك 🔁 (${sessionNo})`, ephemeral: true });
+        return safeReply(interaction, { content: `✅ تم تسجيل دخولك 🔁 (${sessionNo})`, ephemeral: true });
       }
 
       if (interaction.customId === "att_out") {
         const openSession = await getOpenSession(gid, uid);
         if (!openSession) {
-          return interaction.reply({ content: "⚠️ ما عندك جلسة مفتوحة. سجل دخول أول.", ephemeral: true });
+          return safeReply(interaction, { content: "⚠️ ما عندك جلسة مفتوحة. سجل دخول أول.", ephemeral: true });
         }
 
         const duration = ms - openSession.checkin_ms;
@@ -603,7 +620,7 @@ client.on("interactionCreate", async (interaction) => {
           .setColor(0xff3344);
 
         await sendLog(interaction.guild, settingsRow, emb);
-        return interaction.reply({
+        return safeReply(interaction, {
           content: `💤 تم تسجيل خروجك — ⏱️ ${msToHMS(duration)} 🔁 (${openSession.session_no})`,
           ephemeral: true,
         });
@@ -611,14 +628,11 @@ client.on("interactionCreate", async (interaction) => {
     }
   } catch (e) {
     console.error("INTERACTION ERROR:", e);
-    try {
-      const msg = "صار خطأ بسيط. تأكد من صلاحيات البوت + روم اللوق.";
-      if (interaction?.replied || interaction?.deferred) {
-        await interaction.followUp({ content: msg, ephemeral: true });
-      } else if (interaction?.isRepliable()) {
-        await interaction.reply({ content: msg, ephemeral: true });
-      }
-    } catch {}
+    // رد آمن بدون ما يخرب لو التفاعل انتهى/تم الرد
+    return safeReply(interaction, {
+      content: "صار خطأ بسيط. تأكد من صلاحيات البوت + روم اللوق.",
+      ephemeral: true,
+    });
   }
 });
 
